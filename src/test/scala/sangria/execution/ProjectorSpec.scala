@@ -12,11 +12,25 @@ import scala.util.{Success, Try}
 
 class ProjectorSpec extends WordSpec with Matchers with FutureResultSupport {
   case class Product(id: String, variants: List[Variant])
-  case class Variant(id: String, relatedProductIds: List[String])
+  case class Variant(id: String, relatedProductIds: List[String], categories: List[Reference])
 
   case class ProductDefer(productIds: List[String]) extends Deferred[List[Right[String, Product]]]
 
-  val VariantType = ObjectType("Variant", () ⇒ fields[Unit, Variant](
+  case class Category(id: String, name: String)
+  case class Reference(id: String, typeId: String)
+  case class CategoryReferenceDefer(references: List[Reference]) extends Deferred[List[Category]]
+
+  val CategoryType = ObjectType("Category",
+    fields[Unit, Category](
+      Field("id", IDType,
+        tags = ProjectionName("id") :: Nil,
+        resolve = _.value.id),
+      Field("name", StringType,
+        tags = ProjectionName("name") :: Nil,
+        resolve = _.value.name)
+    ))
+
+  val VariantType = ObjectType("Variant", () ⇒ fields[Ctx, Variant](
     Field("id", IDType, resolve = _.value.id),
     Field("mixed", StringType,
       tags = ProjectionName("mixed1") :: ProjectionName("mixed2") :: Nil,
@@ -27,7 +41,14 @@ class ProjectorSpec extends WordSpec with Matchers with FutureResultSupport {
       resolve = Projector(1, (ctx, projected) ⇒ projected match {
         case Vector(ProjectedName("id", _)) ⇒ Value(ctx.value.relatedProductIds map (Left(_)))
         case _ ⇒ ProductDefer(ctx.value.relatedProductIds)
-      }))
+      })),
+    Field("categories", ListType(CategoryType),
+      tags = ProjectionName("categories.id") :: ProjectionName("categories.typeId") :: Nil,
+      resolve = Projector { (ctx, projected) ⇒
+        val references = ctx.value.categories
+        ctx.ctx.categoryProjections = projected
+        CategoryReferenceDefer(references)
+      })
   ))
 
   val ProductType: ObjectType[Unit, Either[String, Product]] =
@@ -61,18 +82,28 @@ class ProjectorSpec extends WordSpec with Matchers with FutureResultSupport {
     def products: List[Product]
   }
 
-  class Ctx extends WithProducts {
+  trait WithCategories {
+    def categories: List[Category]
+  }
+
+  class Ctx extends WithProducts with WithCategories {
     val products: List[Product] = List(
       Product("1", List(
-        Variant("1", Nil),
-        Variant("2", List("1", "2"))
+        Variant("1", Nil, List(Reference("1", "categories"), Reference("2", "categories"))),
+        Variant("2", List("1", "2"), Nil)
       )),
       Product("2", List(
-        Variant("1", Nil)
+        Variant("1", Nil, Nil)
       ))
     )
 
+    val categories: List[Category] = List(
+      Category("1", "category 1"),
+      Category("2", "category 2")
+    )
+
     var allProjections: Vector[ProjectedName] = Vector.empty
+    var categoryProjections: Vector[ProjectedName] = Vector.empty
     var oneLevelprojections: Vector[ProjectedName] = Vector.empty
   }
 
@@ -80,6 +111,13 @@ class ProjectorSpec extends WordSpec with Matchers with FutureResultSupport {
     override def resolve(deferred: Vector[Deferred[Any]], ctx: WithProducts, queryState: Any)(implicit ec: ExecutionContext) = deferred map {
       case ProductDefer(ids) ⇒
         Future.fromTry(Try(ids map (id ⇒ Right(ctx.products.find(_.id == id).get))))
+    }
+  }
+
+  class CategoryResolver extends DeferredResolver[WithCategories] {
+    override def resolve(deferred: Vector[Deferred[Any]], ctx: WithCategories, queryState: Any)(implicit ec: ExecutionContext) = deferred map {
+      case CategoryReferenceDefer(references) ⇒
+        Future.fromTry(Try(references map (ref ⇒ ctx.categories.find(_.id == ref.id).get)))
     }
   }
 
@@ -255,6 +293,71 @@ class ProjectorSpec extends WordSpec with Matchers with FutureResultSupport {
           ProjectedName("master1", Vector.empty),
           ProjectedName("master2", Vector.empty),
           ProjectedName("variants", Vector.empty)))
+    }
+
+    "handle projected fields different at each level" in {
+      val Success(query) = QueryParser.parse(
+        """
+          {
+            projectAll {
+              id
+              masterVariant {
+                categories {
+                  name
+                }
+              }
+            }
+          }
+        """)
+
+      val ctx = new Ctx
+
+      Executor.execute(schema, query, ctx, deferredResolver = new CategoryResolver).await should be (
+        Map("data" →
+          Map(
+            "projectAll" → Vector(
+              Map(
+                "id" → "1",
+                "masterVariant" →
+                  Map("categories" → Vector(
+                    Map("name" → "category 1"),
+                    Map("name" → "category 2")
+                  ))),
+            Map("id" → "2",
+              "masterVariant" →
+              Map("categories" → Vector.empty))))))
+
+      // There should be a way to define we want to select (id, typeId) from categories
+      // and there should be a way to have only projections for the first level
+//      ctx.allProjections should be (
+//        Vector(
+//          ProjectedName("id", Vector.empty),
+//          ProjectedName("master1", Vector(
+//            ProjectedName("categories", Vector(
+//              ProjectedName("id", Vector.empty),
+//              ProjectedName("typeId", Vector.empty))))),
+//          ProjectedName("master2", Vector(
+//            ProjectedName("categories", Vector(
+//              ProjectedName("id", Vector.empty),
+//              ProjectedName("typeId", Vector.empty)))))))
+
+      ctx.allProjections should be (
+        Vector(
+          ProjectedName("id", Vector()),
+          ProjectedName("master1", Vector(
+            ProjectedName("categories.id", Vector(
+              ProjectedName("name", Vector()))),
+            ProjectedName("categories.typeId", Vector(
+              ProjectedName("name",Vector()))))),
+          ProjectedName("master2", Vector(
+            ProjectedName("categories.id", Vector(
+              ProjectedName("name", Vector()))),
+            ProjectedName("categories.typeId", Vector(
+              ProjectedName("name",Vector())))))))
+
+      ctx.categoryProjections should be (
+        Vector(
+          ProjectedName("name", Vector.empty)))
     }
   }
 }
